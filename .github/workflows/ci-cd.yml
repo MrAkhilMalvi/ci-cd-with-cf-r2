@@ -11,32 +11,21 @@ permissions:
 
 env:
   NODE_VERSION: "20"
-  IMAGE_NAME: ghcr.io/${{ github.repository }}:latest
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Log - Start build job
-        run: echo "Starting build job on $(date -u) in $GITHUB_WORKSPACE"
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-      - name: Install dependencies
-        run: |
-          echo "Installing dependencies..."
-          npm install
-      - name: Build
-        run: |
-          echo "Running build..."
-          npm run build
-          echo "Build complete. Listing dist contents:"
-          ls -la dist
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+
+      - run: npm install
+      - run: npm run build
+
+      - uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist
@@ -44,29 +33,38 @@ jobs:
   upload_r2:
     runs-on: ubuntu-latest
     needs: build
-    env:
-      R2_BUCKET: ${{ secrets.R2_BUCKET }}
     steps:
-      - name: Download build artifact
-        if: ${{ env.R2_BUCKET != '' }}
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist
 
-      - name: Upload to Cloudflare R2
-        if: ${{ env.R2_BUCKET != '' }}
+      - name: Upload frontend to Cloudflare R2
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_REGION: us-east-1
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
         run: |
-          echo "Uploading dist to R2 bucket: $R2_BUCKET"
           aws s3 sync dist s3://$R2_BUCKET \
             --endpoint-url https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com \
             --delete
+
+  deploy_worker:
+    runs-on: ubuntu-latest
+    needs: upload_r2
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Wrangler
+        run: npm install -g wrangler
+
+      - name: Deploy Cloudflare Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: wrangler deploy
 
   docker_build_push:
     runs-on: ubuntu-latest
@@ -74,67 +72,33 @@ jobs:
     env:
       DOCKER_PUSH_ENABLED: ${{ secrets.DOCKER_PUSH_ENABLED }}
     steps:
-      - name: Set image name (lowercase)
+      - uses: actions/checkout@v4
         if: ${{ env.DOCKER_PUSH_ENABLED != '' }}
-        run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY,,}:latest" >> $GITHUB_ENV
-      - name: Checkout
+
+      - uses: docker/login-action@v3
         if: ${{ env.DOCKER_PUSH_ENABLED != '' }}
-        uses: actions/checkout@v4
-      - name: Log - Docker build
-        if: ${{ env.DOCKER_PUSH_ENABLED != '' }}
-        run: echo "Building Docker image $IMAGE_NAME"
-      - name: Login to GHCR
-        if: ${{ env.DOCKER_PUSH_ENABLED != '' }}
-        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ secrets.GHCR_USERNAME || github.actor }}
           password: ${{ secrets.GHCR_PAT || github.token }}
-      - name: Build and push image
+
+      - uses: docker/build-push-action@v6
         if: ${{ env.DOCKER_PUSH_ENABLED != '' }}
-        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ env.IMAGE_NAME }}
+          tags: ghcr.io/${{ github.repository }}:latest
 
   deploy_vps:
     runs-on: ubuntu-latest
     needs: docker_build_push
-    env:
-      VPS_HOST: ${{ secrets.VPS_HOST }}
-      DOCKER_PUSH_ENABLED: ${{ secrets.DOCKER_PUSH_ENABLED }}
+    if: ${{ secrets.VPS_HOST != '' && secrets.DOCKER_PUSH_ENABLED != '' }}
     steps:
-      - name: Set image name (lowercase)
-        if: ${{ env.DOCKER_PUSH_ENABLED != '' }}
-        run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY,,}:latest" >> $GITHUB_ENV
-      - name: Deploy via SSH
-        if: ${{ env.VPS_HOST != '' && env.DOCKER_PUSH_ENABLED != '' }}
-        uses: appleboy/ssh-action@v1.0.3
-        env:
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+      - uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_KEY }}
-          envs: IMAGE_NAME
           script: |
-            set -e
-            echo "Deploying on VPS: $(hostname)"
-            echo "Using image: $IMAGE_NAME"
-            mkdir -p ~/cf-r2-vite-react
-            cat > ~/cf-r2-vite-react/.env <<'EOT'
-            IMAGE=$IMAGE_NAME
-            EOT
-            cat > ~/cf-r2-vite-react/docker-compose.yml <<'EOT'
-            services:
-              web:
-                image: ${IMAGE}
-                ports:
-                  - "8083:80"
-                restart: unless-stopped
-            EOT
-            docker login ghcr.io -u ${{ secrets.GHCR_USERNAME }} -p ${{ secrets.GHCR_PAT }}
-            docker pull $IMAGE_NAME
-            docker compose -f ~/cf-r2-vite-react/docker-compose.yml up -d
-            echo "Deploy complete."
+            docker pull ghcr.io/${{ github.repository }}:latest
+            docker compose up -d

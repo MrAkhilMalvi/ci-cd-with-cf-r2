@@ -1,0 +1,7 @@
+name = "frontend-worker"
+main = "worker.js"
+compatibility_date = "2026-02-06"
+
+[[r2_buckets]]
+binding = "FRONTEND_BUCKET"
+bucket_name = "ci-cd-with-cf-r2"
