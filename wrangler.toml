@@ -1,4 +1,4 @@
-name = "frontend-worker"
+name = "ci-cd-with-cf-r2"
 main = "worker.js"
 compatibility_date = "2026-02-06"
 
